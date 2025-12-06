@@ -1,11 +1,22 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { ethers } from "ethers";
-import { uploadToIPFS, fetchFromIPFS } from "../utils/ipfs";
+import { fetchFromIPFS } from "../utils/ipfs";
+
+// Type declaration for window.ethereum
+declare global {
+  interface Window {
+    ethereum?: {
+      request: (args: { method: string; params?: any[] }) => Promise<any>;
+      send: (method: string, params?: any[]) => Promise<any>;
+    };
+  }
+}
 
 // Contract ABI (minimal for what we need)
 const INTENT_REGISTRY_ABI = [
   "function publishIntent(string memory message, string memory category, string memory cid) public",
   "function getAllIntents() public view returns (tuple(address user, string message, string category, string cid, uint256 timestamp)[])",
+  "function getIntentsPaginated(uint256 offset, uint256 limit) public view returns (tuple(address user, string message, string category, string cid, uint256 timestamp)[])",
   "function getIntentCount() public view returns (uint256)",
   "event IntentPublished(uint256 indexed intentId, address indexed user, string message, string category, string cid, uint256 timestamp)"
 ];
@@ -18,9 +29,17 @@ export default function Home() {
   const [intents, setIntents] = useState<any[]>([]);
   const [matches, setMatches] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMatches, setLoadingMatches] = useState(false);
+  const [loadingIntents, setLoadingIntents] = useState(false);
+  const [networkError, setNetworkError] = useState<string>("");
+  const [txStatus, setTxStatus] = useState<{hash?: string, status?: "pending" | "success" | "error", message?: string}>({});
+  const switchingNetworkRef = useRef(false);
   const [message, setMessage] = useState("");
   const [category, setCategory] = useState("");
   const [budget, setBudget] = useState("");
+
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+  const EXPECTED_CHAIN_ID = process.env.NEXT_PUBLIC_CHAIN_ID ? parseInt(process.env.NEXT_PUBLIC_CHAIN_ID) : 31337;
 
   const contractAddress = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || "";
 
@@ -33,51 +52,10 @@ export default function Home() {
     }
   }, []);
 
-  useEffect(() => {
-    if (contract && account) {
-      loadIntents();
-      loadMatches();
-    }
-  }, [contract, account]);
-
-  const connectWallet = async () => {
-    if (typeof window.ethereum !== "undefined") {
-      try {
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        await provider.send("eth_requestAccounts", []);
-        const signer = await provider.getSigner();
-        const address = await signer.getAddress();
-
-        console.log("Wallet connected:", address);
-        console.log("Contract address from env:", contractAddress);
-
-        setProvider(provider);
-        setSigner(signer);
-        setAccount(address);
-
-        if (contractAddress) {
-          const contractInstance = new ethers.Contract(
-            contractAddress,
-            INTENT_REGISTRY_ABI,
-            signer
-          );
-          setContract(contractInstance);
-          console.log("Contract instance created");
-        } else {
-          alert("Contract address not configured! Please check your .env.local file.");
-        }
-      } catch (error) {
-        console.error("Error connecting wallet:", error);
-        alert("Failed to connect wallet: " + (error as Error).message);
-      }
-    } else {
-      alert("Please install MetaMask!");
-    }
-  };
-
-  const loadIntents = async () => {
+  const loadIntents = useCallback(async () => {
     if (!contract) return;
 
+    setLoadingIntents(true);
     try {
       // First check if there are any intents
       const count = await contract.getIntentCount();
@@ -90,7 +68,15 @@ export default function Home() {
         return;
       }
 
-      const allIntents = await contract.getAllIntents();
+      // Use pagination for gas efficiency (fetch in batches of 50)
+      const PAGE_SIZE = 50;
+      const allIntents: any[] = [];
+      
+      for (let offset = 0; offset < intentCount; offset += PAGE_SIZE) {
+        const page = await contract.getIntentsPaginated(offset, PAGE_SIZE);
+        allIntents.push(...page);
+      }
+
       const formattedIntents = allIntents.map((intent: any, index: number) => ({
         id: index,
         user: intent.user,
@@ -122,17 +108,185 @@ export default function Home() {
         console.log("Contract appears empty or not initialized, showing empty list");
         setIntents([]);
       }
+    } finally {
+      setLoadingIntents(false);
     }
-  };
+  }, [contract]);
 
-  const loadMatches = async () => {
+  const loadMatches = useCallback(async () => {
+    setLoadingMatches(true);
     try {
-      const response = await fetch("http://localhost:3001/matches");
+      const response = await fetch(`${API_URL}/matches`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
       const data = await response.json();
       setMatches(data.matches || []);
     } catch (error) {
       console.error("Error loading matches:", error);
+      setMatches([]); // Set empty array on error
+    } finally {
+      setLoadingMatches(false);
     }
+  }, [API_URL]);
+
+  useEffect(() => {
+    if (contract && account) {
+      loadIntents();
+      loadMatches();
+    }
+  }, [contract, account, loadIntents, loadMatches]);
+
+  const checkNetwork = async (provider: ethers.BrowserProvider): Promise<boolean> => {
+    // Prevent multiple simultaneous network switch requests using ref (faster than state)
+    if (switchingNetworkRef.current) {
+      console.log("Network switch already in progress, skipping...");
+      return false;
+    }
+
+    try {
+      const network = await provider.getNetwork();
+      const chainId = Number(network.chainId);
+      
+      console.log("Current chain ID:", chainId, "Expected:", EXPECTED_CHAIN_ID);
+      
+      if (chainId !== EXPECTED_CHAIN_ID) {
+        // Set flag immediately before making request
+        switchingNetworkRef.current = true;
+        setNetworkError(`Wrong network! Please switch to chain ID ${EXPECTED_CHAIN_ID}`);
+        
+        // Try to switch network
+        try {
+          if (!window.ethereum) {
+            setNetworkError("MetaMask not found");
+            switchingNetworkRef.current = false;
+            return false;
+          }
+          
+          try {
+            await window.ethereum.request({
+              method: "wallet_switchEthereumChain",
+              params: [{ chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}` }],
+            });
+            setNetworkError("");
+            switchingNetworkRef.current = false;
+            return true;
+          } catch (switchError: any) {
+            // Handle "already pending" error - this is OK, just wait
+            if (switchError.code === -32002 || switchError.message?.includes("already pending")) {
+              console.log("Network switch request already pending in MetaMask - this is normal");
+              setNetworkError("Please approve the network switch in MetaMask");
+              // Reset flag after a delay to allow user to approve
+              setTimeout(() => {
+                switchingNetworkRef.current = false;
+              }, 10000); // 10 seconds should be enough
+              return false;
+            }
+            
+            // Chain doesn't exist, try to add it
+            if (switchError.code === 4902 && window.ethereum) {
+              try {
+                await window.ethereum.request({
+                  method: "wallet_addEthereumChain",
+                  params: [{
+                    chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}`,
+                    chainName: "Hardhat Local",
+                    nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                    rpcUrls: ["http://127.0.0.1:8545"],
+                  }],
+                });
+                setNetworkError("");
+                switchingNetworkRef.current = false;
+                return true;
+              } catch (addError: any) {
+                if (addError.code === -32002 || addError.message?.includes("already pending")) {
+                  console.log("Add network request already pending in MetaMask");
+                  setNetworkError("Please approve adding the network in MetaMask");
+                  setTimeout(() => {
+                    switchingNetworkRef.current = false;
+                  }, 10000);
+                  return false;
+                }
+                setNetworkError(`Please add network with chain ID ${EXPECTED_CHAIN_ID} manually in MetaMask`);
+                switchingNetworkRef.current = false;
+                return false;
+              }
+            }
+            setNetworkError(`Please switch to chain ID ${EXPECTED_CHAIN_ID} in MetaMask`);
+            switchingNetworkRef.current = false;
+            return false;
+          }
+        } catch (error: any) {
+          console.error("Network switch error:", error);
+          switchingNetworkRef.current = false;
+          if (error.code === -32002 || error.message?.includes("already pending")) {
+            setNetworkError("Network switch request pending. Please check MetaMask.");
+          } else {
+            setNetworkError("Failed to switch network");
+          }
+          return false;
+        }
+      }
+      
+      setNetworkError("");
+      switchingNetworkRef.current = false;
+      return true;
+    } catch (error) {
+      console.error("Error checking network:", error);
+      setNetworkError("Could not verify network");
+      switchingNetworkRef.current = false;
+      return false;
+    }
+  };
+
+  const connectWallet = async () => {
+    if (typeof window.ethereum !== "undefined") {
+      try {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        await provider.send("eth_requestAccounts", []);
+        
+        const signer = await provider.getSigner();
+        const address = await signer.getAddress();
+
+        console.log("Wallet connected:", address);
+        console.log("Contract address from env:", contractAddress);
+
+        setProvider(provider);
+        setSigner(signer);
+        setAccount(address);
+
+        if (contractAddress) {
+          const contractInstance = new ethers.Contract(
+            contractAddress,
+            INTENT_REGISTRY_ABI,
+            signer
+          );
+          setContract(contractInstance);
+          console.log("Contract instance created");
+        } else {
+          alert("Contract address not configured! Please check your .env.local file.");
+        }
+
+        // Check network after connecting (non-blocking)
+        // This allows connection to proceed even if network is wrong
+        checkNetwork(provider).catch(err => {
+          console.error("Network check error:", err);
+        });
+      } catch (error) {
+        console.error("Error connecting wallet:", error);
+        alert("Failed to connect wallet: " + (error as Error).message);
+      }
+    } else {
+      alert("Please install MetaMask!");
+    }
+  };
+
+  // Input sanitization
+  const sanitizeInput = (input: string, maxLength: number): string => {
+    return input
+      .trim()
+      .slice(0, maxLength)
+      .replace(/[<>]/g, ""); // Remove potential HTML tags
   };
 
   const publishIntent = async () => {
@@ -145,7 +299,7 @@ export default function Home() {
     try {
       let cid = "ipfs-placeholder"; // Default if IPFS is unavailable
       
-      // Try to upload metadata to IPFS (optional - if it fails, use placeholder)
+      // Try to upload metadata to IPFS via backend (token not exposed)
       try {
         const ipfsData = {
           message,
@@ -153,7 +307,21 @@ export default function Home() {
           budget: budget || undefined,
           timestamp: new Date().toISOString(),
         };
-        cid = await uploadToIPFS(ipfsData);
+        
+        const response = await fetch(`${API_URL}/api/upload-ipfs`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ data: ipfsData }),
+        });
+        
+        if (!response.ok) {
+          throw new Error(`Upload failed: ${response.statusText}`);
+        }
+        
+        const result = await response.json();
+        cid = result.cid;
         console.log("IPFS upload successful, CID:", cid);
       } catch (ipfsError: any) {
         console.warn("IPFS upload failed (web3.storage may be down), using placeholder:", ipfsError.message);
@@ -162,13 +330,20 @@ export default function Home() {
         alert("Note: IPFS upload failed (web3.storage is down), but your intent will still be published on-chain.");
       }
 
+      // Sanitize inputs before sending
+      const sanitizedMessage = sanitizeInput(message, 500);
+      const sanitizedCategory = sanitizeInput(category, 50);
+
       // Publish intent on-chain (this is the important part)
       console.log("Publishing intent on-chain...");
-      const tx = await contract.publishIntent(message, category, cid);
+      setTxStatus({ status: "pending", message: "Transaction pending..." });
+      const tx = await contract.publishIntent(sanitizedMessage, sanitizedCategory, cid);
       console.log("Transaction sent:", tx.hash);
+      setTxStatus({ hash: tx.hash, status: "pending", message: "Waiting for confirmation..." });
       
       await tx.wait();
       console.log("Transaction confirmed!");
+      setTxStatus({ hash: tx.hash, status: "success", message: "Transaction confirmed!" });
 
       // Reload intents
       await loadIntents();
@@ -179,10 +354,30 @@ export default function Home() {
       setCategory("");
       setBudget("");
       
-      alert("Intent published successfully! ✅");
+      // Clear status after 3 seconds
+      setTimeout(() => setTxStatus({}), 3000);
     } catch (error: any) {
       console.error("Error publishing intent:", error);
-      alert(`Error: ${error.message || "Failed to publish intent"}`);
+      
+      // Handle specific contract errors
+      let errorMessage = "Failed to publish intent";
+      if (error.message) {
+        if (error.message.includes("Message cannot be empty") || 
+            error.message.includes("Category cannot be empty") ||
+            error.message.includes("CID cannot be empty")) {
+          errorMessage = "Please fill in all required fields";
+        } else if (error.message.includes("too long")) {
+          errorMessage = error.message.match(/too long.*/)?.[0] || "Input too long";
+        } else if (error.message.includes("Rate limit exceeded")) {
+          errorMessage = "You've reached the daily limit (10 intents per day). Try again tomorrow.";
+        } else if (error.message.includes("user rejected")) {
+          errorMessage = "Transaction was cancelled";
+        } else {
+          errorMessage = error.message;
+        }
+      }
+      
+      alert(`Error: ${errorMessage}`);
     } finally {
       setLoading(false);
     }
@@ -221,28 +416,62 @@ export default function Home() {
       ) : (
         <div>
           <p>Connected: {account}</p>
+          {networkError && (
+            <div style={{ 
+              padding: "10px", 
+              backgroundColor: "#ffebee", 
+              border: "1px solid #f44336", 
+              borderRadius: "5px",
+              marginTop: "10px",
+              color: "#c62828"
+            }}>
+              ⚠️ {networkError}
+            </div>
+          )}
 
           <div style={{ marginTop: "30px", padding: "20px", border: "1px solid #ddd", borderRadius: "5px" }}>
             <h2>Publish Intent</h2>
             <div style={{ marginBottom: "15px" }}>
-              <label style={{ display: "block", marginBottom: "5px" }}>Message:</label>
+              <label style={{ display: "block", marginBottom: "5px" }}>Message: <span style={{ color: "#666", fontSize: "12px" }}>(max 500 chars)</span></label>
               <input
                 type="text"
                 value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val.length <= 500) {
+                    setMessage(val);
+                  }
+                }}
                 placeholder="What do you want or offer?"
+                maxLength={500}
                 style={{ width: "100%", padding: "8px", fontSize: "14px" }}
               />
+              {message.length > 0 && (
+                <span style={{ fontSize: "12px", color: message.length > 500 ? "red" : "#666" }}>
+                  {message.length}/500
+                </span>
+              )}
             </div>
             <div style={{ marginBottom: "15px" }}>
-              <label style={{ display: "block", marginBottom: "5px" }}>Category:</label>
+              <label style={{ display: "block", marginBottom: "5px" }}>Category: <span style={{ color: "#666", fontSize: "12px" }}>(max 50 chars)</span></label>
               <input
                 type="text"
                 value={category}
-                onChange={(e) => setCategory(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val.length <= 50) {
+                    setCategory(val);
+                  }
+                }}
                 placeholder="e.g., design, development, marketing"
+                maxLength={50}
                 style={{ width: "100%", padding: "8px", fontSize: "14px" }}
               />
+              {category.length > 0 && (
+                <span style={{ fontSize: "12px", color: category.length > 50 ? "red" : "#666" }}>
+                  {category.length}/50
+                </span>
+              )}
             </div>
             <div style={{ marginBottom: "15px" }}>
               <label style={{ display: "block", marginBottom: "5px" }}>Budget (optional):</label>
@@ -269,25 +498,47 @@ export default function Home() {
             >
               {loading ? "Publishing..." : "Publish Intent"}
             </button>
+            {txStatus.status && (
+              <div style={{
+                marginTop: "10px",
+                padding: "10px",
+                backgroundColor: txStatus.status === "success" ? "#e8f5e9" : txStatus.status === "error" ? "#ffebee" : "#fff3e0",
+                border: `1px solid ${txStatus.status === "success" ? "#4caf50" : txStatus.status === "error" ? "#f44336" : "#ff9800"}`,
+                borderRadius: "5px",
+                color: txStatus.status === "success" ? "#2e7d32" : txStatus.status === "error" ? "#c62828" : "#e65100"
+              }}>
+                {txStatus.status === "pending" && "⏳ "}
+                {txStatus.status === "success" && "✅ "}
+                {txStatus.status === "error" && "❌ "}
+                {txStatus.message}
+                {txStatus.hash && (
+                  <div style={{ fontSize: "12px", marginTop: "5px" }}>
+                    TX: {txStatus.hash.slice(0, 10)}...{txStatus.hash.slice(-8)}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div style={{ marginTop: "30px" }}>
             <h2>All Intents ({intents.length})</h2>
             <button
               onClick={loadIntents}
+              disabled={loadingIntents}
               style={{
                 padding: "8px 16px",
                 fontSize: "14px",
-                backgroundColor: "#666",
+                backgroundColor: loadingIntents ? "#ccc" : "#666",
                 color: "white",
                 border: "none",
                 borderRadius: "5px",
-                cursor: "pointer",
+                cursor: loadingIntents ? "not-allowed" : "pointer",
                 marginBottom: "10px",
               }}
             >
-              Refresh
+              {loadingIntents ? "Loading..." : "Refresh"}
             </button>
+            {loadingIntents && <p style={{ color: "#666", fontSize: "14px" }}>Loading intents...</p>}
             <div style={{ display: "grid", gap: "15px" }}>
               {intents.map((intent) => (
                 <div
@@ -316,19 +567,21 @@ export default function Home() {
             <h2>Matches ({matches.length})</h2>
             <button
               onClick={loadMatches}
+              disabled={loadingMatches}
               style={{
                 padding: "8px 16px",
                 fontSize: "14px",
-                backgroundColor: "#666",
+                backgroundColor: loadingMatches ? "#ccc" : "#666",
                 color: "white",
                 border: "none",
                 borderRadius: "5px",
-                cursor: "pointer",
+                cursor: loadingMatches ? "not-allowed" : "pointer",
                 marginBottom: "10px",
               }}
             >
-              Refresh
+              {loadingMatches ? "Loading..." : "Refresh"}
             </button>
+            {loadingMatches && <p style={{ color: "#666", fontSize: "14px" }}>Loading matches...</p>}
             <div style={{ display: "grid", gap: "15px" }}>
               {matches.map((match) => (
                 <div

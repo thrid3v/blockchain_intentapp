@@ -18,6 +18,11 @@ contracts/artifacts/
 contracts/cache/
 contracts/deployments/
 
+# Database
+backend/data/
+*.db
+*.db-journal
+
 # IDE
 .vscode/
 .idea/
@@ -26,4 +31,3 @@ contracts/deployments/
 
 # OS
 Thumbs.db
-
