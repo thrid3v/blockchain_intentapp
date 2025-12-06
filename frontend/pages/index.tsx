@@ -25,6 +25,15 @@ export default function Home() {
   const contractAddress = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || "";
 
   useEffect(() => {
+    // Debug: Check if contract address is loaded
+    if (!contractAddress) {
+      console.error("Contract address not found! Check NEXT_PUBLIC_CONTRACT_ADDRESS in .env.local");
+    } else {
+      console.log("Contract address:", contractAddress);
+    }
+  }, []);
+
+  useEffect(() => {
     if (contract && account) {
       loadIntents();
       loadMatches();
@@ -39,6 +48,9 @@ export default function Home() {
         const signer = await provider.getSigner();
         const address = await signer.getAddress();
 
+        console.log("Wallet connected:", address);
+        console.log("Contract address from env:", contractAddress);
+
         setProvider(provider);
         setSigner(signer);
         setAccount(address);
@@ -50,10 +62,13 @@ export default function Home() {
             signer
           );
           setContract(contractInstance);
+          console.log("Contract instance created");
+        } else {
+          alert("Contract address not configured! Please check your .env.local file.");
         }
       } catch (error) {
         console.error("Error connecting wallet:", error);
-        alert("Failed to connect wallet");
+        alert("Failed to connect wallet: " + (error as Error).message);
       }
     } else {
       alert("Please install MetaMask!");
@@ -64,6 +79,17 @@ export default function Home() {
     if (!contract) return;
 
     try {
+      // First check if there are any intents
+      const count = await contract.getIntentCount();
+      const intentCount = Number(count);
+      
+      console.log("Intent count:", intentCount);
+      
+      if (intentCount === 0) {
+        setIntents([]);
+        return;
+      }
+
       const allIntents = await contract.getAllIntents();
       const formattedIntents = allIntents.map((intent: any, index: number) => ({
         id: index,
@@ -74,22 +100,28 @@ export default function Home() {
         timestamp: Number(intent.timestamp),
       }));
 
-      // Try to fetch IPFS data for each intent
+      // Try to fetch IPFS data for each intent (optional, don't fail if IPFS is down)
       const intentsWithData = await Promise.all(
         formattedIntents.map(async (intent) => {
           try {
             const ipfsData = await fetchFromIPFS(intent.cid);
             return { ...intent, ipfsData };
           } catch (error) {
-            console.error(`Failed to fetch IPFS data for ${intent.cid}:`, error);
+            // Silently fail IPFS fetch - it's optional metadata
+            console.warn(`Could not fetch IPFS data for ${intent.cid} (this is okay)`);
             return intent;
           }
         })
       );
 
       setIntents(intentsWithData);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error loading intents:", error);
+      // If contract is empty or not deployed, just set empty array
+      if (error.message?.includes("could not decode") || error.message?.includes("BAD_DATA")) {
+        console.log("Contract appears empty or not initialized, showing empty list");
+        setIntents([]);
+      }
     }
   };
 
@@ -111,16 +143,27 @@ export default function Home() {
 
     setLoading(true);
     try {
-      // Upload metadata to IPFS
-      const ipfsData = {
-        message,
-        category,
-        budget: budget || undefined,
-        timestamp: new Date().toISOString(),
-      };
-      const cid = await uploadToIPFS(ipfsData);
+      let cid = "ipfs-placeholder"; // Default if IPFS is unavailable
+      
+      // Try to upload metadata to IPFS (optional - if it fails, use placeholder)
+      try {
+        const ipfsData = {
+          message,
+          category,
+          budget: budget || undefined,
+          timestamp: new Date().toISOString(),
+        };
+        cid = await uploadToIPFS(ipfsData);
+        console.log("IPFS upload successful, CID:", cid);
+      } catch (ipfsError: any) {
+        console.warn("IPFS upload failed (web3.storage may be down), using placeholder:", ipfsError.message);
+        // Use a placeholder CID - the contract will still work
+        cid = `ipfs-unavailable-${Date.now()}`;
+        alert("Note: IPFS upload failed (web3.storage is down), but your intent will still be published on-chain.");
+      }
 
-      // Publish intent on-chain
+      // Publish intent on-chain (this is the important part)
+      console.log("Publishing intent on-chain...");
       const tx = await contract.publishIntent(message, category, cid);
       console.log("Transaction sent:", tx.hash);
       
@@ -135,6 +178,8 @@ export default function Home() {
       setMessage("");
       setCategory("");
       setBudget("");
+      
+      alert("Intent published successfully! ✅");
     } catch (error: any) {
       console.error("Error publishing intent:", error);
       alert(`Error: ${error.message || "Failed to publish intent"}`);
@@ -167,6 +212,11 @@ export default function Home() {
           >
             Connect MetaMask
           </button>
+          {!contractAddress && (
+            <p style={{ color: "red", marginTop: "10px" }}>
+              ⚠️ Contract address not configured! Check .env.local file.
+            </p>
+          )}
         </div>
       ) : (
         <div>
