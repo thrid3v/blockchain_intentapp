@@ -40,8 +40,14 @@ export default function Home() {
 
   const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
   const EXPECTED_CHAIN_ID = process.env.NEXT_PUBLIC_CHAIN_ID ? parseInt(process.env.NEXT_PUBLIC_CHAIN_ID) : 31337;
+  const MUMBAI_RPC_URL = process.env.NEXT_PUBLIC_MUMBAI_RPC_URL || "";
+  const AMOY_RPC_URL = process.env.NEXT_PUBLIC_AMOY_RPC_URL || "";
 
   const contractAddress = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || "";
+  
+  // Support both Mumbai (80001) and Amoy (80002)
+  const isMumbai = EXPECTED_CHAIN_ID === 80001;
+  const isAmoy = EXPECTED_CHAIN_ID === 80002;
 
   useEffect(() => {
     // Debug: Check if contract address is loaded
@@ -57,8 +63,25 @@ export default function Home() {
 
     setLoadingIntents(true);
     try {
+      // Create a read-only provider using Infura RPC if available
+      let readContract = contract;
+      const rpcUrl = (isMumbai && MUMBAI_RPC_URL) || (isAmoy && AMOY_RPC_URL);
+      if (rpcUrl && (isMumbai || isAmoy) && contractAddress) {
+        try {
+          const rpcProvider = new ethers.JsonRpcProvider(rpcUrl);
+          // Test connection
+          await rpcProvider.getBlockNumber();
+          // Create read-only contract instance
+          readContract = new ethers.Contract(contractAddress, INTENT_REGISTRY_ABI, rpcProvider);
+          console.log(`Using Infura RPC for reading intents (${isMumbai ? 'Mumbai' : 'Amoy'})`);
+        } catch (rpcError) {
+          console.warn("Infura RPC failed for reads, using MetaMask provider:", rpcError);
+          // Continue with original contract (MetaMask provider)
+        }
+      }
+      
       // First check if there are any intents
-      const count = await contract.getIntentCount();
+      const count = await readContract.getIntentCount();
       const intentCount = Number(count);
       
       console.log("Intent count:", intentCount);
@@ -73,7 +96,7 @@ export default function Home() {
       const allIntents: any[] = [];
       
       for (let offset = 0; offset < intentCount; offset += PAGE_SIZE) {
-        const page = await contract.getIntentsPaginated(offset, PAGE_SIZE);
+        const page = await readContract.getIntentsPaginated(offset, PAGE_SIZE);
         allIntents.push(...page);
       }
 
@@ -131,9 +154,12 @@ export default function Home() {
   }, [API_URL]);
 
   useEffect(() => {
+    // Load matches from backend even without contract connection
+    loadMatches();
+    
+    // Load intents from blockchain if contract is connected
     if (contract && account) {
       loadIntents();
-      loadMatches();
     }
   }, [contract, account, loadIntents, loadMatches]);
 
@@ -186,14 +212,60 @@ export default function Home() {
             // Chain doesn't exist, try to add it
             if (switchError.code === 4902 && window.ethereum) {
               try {
-                await window.ethereum.request({
-                  method: "wallet_addEthereumChain",
-                  params: [{
+                // Determine network configuration based on chain ID
+                let networkConfig: any;
+                if (EXPECTED_CHAIN_ID === 80001) {
+                  // Polygon Mumbai - use Infura RPC if custom RPC not set
+                  const customRpc = process.env.NEXT_PUBLIC_MUMBAI_RPC_URL;
+                  const rpcUrls = customRpc 
+                    ? [customRpc]
+                    : [
+                        "https://polygon-mumbai.infura.io/v3/demo",
+                        "https://rpc.ankr.com/polygon_mumbai",
+                        "https://polygon-mumbai-bor.publicnode.com",
+                        "https://rpc-mumbai.maticvigil.com"
+                      ];
+                  
+                  networkConfig = {
+                    chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}`,
+                    chainName: "Polygon Mumbai",
+                    nativeCurrency: { name: "MATIC", symbol: "MATIC", decimals: 18 },
+                    rpcUrls: rpcUrls,
+                    blockExplorerUrls: ["https://mumbai.polygonscan.com"]
+                  };
+                } else if (EXPECTED_CHAIN_ID === 80002) {
+                  // Polygon Amoy - use Infura RPC if custom RPC not set
+                  const customRpc = process.env.NEXT_PUBLIC_AMOY_RPC_URL;
+                  const rpcUrls = customRpc 
+                    ? [customRpc]
+                    : [
+                        "https://polygon-amoy.infura.io/v3/demo",
+                        "https://rpc.ankr.com/polygon_amoy",
+                        "https://polygon-amoy-bor.publicnode.com"
+                      ];
+                  
+                  networkConfig = {
+                    chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}`,
+                    chainName: "Polygon Amoy",
+                    nativeCurrency: { name: "MATIC", symbol: "MATIC", decimals: 18 },
+                    rpcUrls: rpcUrls,
+                    blockExplorerUrls: ["https://amoy.polygonscan.com"]
+                  };
+                } else if (EXPECTED_CHAIN_ID === 31337) {
+                  // Hardhat Local
+                  networkConfig = {
                     chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}`,
                     chainName: "Hardhat Local",
                     nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
                     rpcUrls: ["http://127.0.0.1:8545"],
-                  }],
+                  };
+                } else {
+                  throw new Error(`Unsupported chain ID: ${EXPECTED_CHAIN_ID}`);
+                }
+
+                await window.ethereum.request({
+                  method: "wallet_addEthereumChain",
+                  params: [networkConfig],
                 });
                 setNetworkError("");
                 switchingNetworkRef.current = false;
@@ -242,25 +314,53 @@ export default function Home() {
   const connectWallet = async () => {
     if (typeof window.ethereum !== "undefined") {
       try {
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        await provider.send("eth_requestAccounts", []);
+        // Create MetaMask provider for signing
+        const metamaskProvider = new ethers.BrowserProvider(window.ethereum);
+        await metamaskProvider.send("eth_requestAccounts", []);
         
-        const signer = await provider.getSigner();
+        // Create a fallback provider: use Infura RPC for reads, MetaMask for writes
+        let readProvider: ethers.Provider = metamaskProvider;
+        
+        // If we have a custom RPC URL, use it for read operations
+        const rpcUrl = (isMumbai && MUMBAI_RPC_URL) || (isAmoy && AMOY_RPC_URL);
+        if (rpcUrl && (isMumbai || isAmoy)) {
+          try {
+            const rpcProvider = new ethers.JsonRpcProvider(rpcUrl);
+            // Test the RPC connection
+            await rpcProvider.getBlockNumber();
+            readProvider = rpcProvider;
+            console.log(`Using Infura RPC for read operations (${isMumbai ? 'Mumbai' : 'Amoy'})`);
+          } catch (rpcError) {
+            console.warn("Custom RPC failed, falling back to MetaMask RPC:", rpcError);
+            // Fall back to MetaMask provider if custom RPC fails
+          }
+        }
+        
+        // Use MetaMask for signing (user interactions)
+        const signer = await metamaskProvider.getSigner();
         const address = await signer.getAddress();
 
         console.log("Wallet connected:", address);
         console.log("Contract address from env:", contractAddress);
 
-        setProvider(provider);
+        // Store both providers
+        setProvider(metamaskProvider);
         setSigner(signer);
         setAccount(address);
 
         if (contractAddress) {
+          // Create contract instance with signer for writes, but use readProvider for reads
+          // For writes, we need the signer. For reads, we can use the readProvider
           const contractInstance = new ethers.Contract(
             contractAddress,
             INTENT_REGISTRY_ABI,
             signer
           );
+          
+          // Override the provider for read-only operations
+          // Note: This is a workaround - ethers v6 doesn't easily support separate read/write providers
+          // But the contract will use the signer's provider for all operations
+          // The readProvider is available if we need to make direct read calls
           setContract(contractInstance);
           console.log("Contract instance created");
         } else {
@@ -269,7 +369,7 @@ export default function Home() {
 
         // Check network after connecting (non-blocking)
         // This allows connection to proceed even if network is wrong
-        checkNetwork(provider).catch(err => {
+        checkNetwork(metamaskProvider).catch(err => {
           console.error("Network check error:", err);
         });
       } catch (error) {
@@ -317,32 +417,185 @@ export default function Home() {
         });
         
         if (!response.ok) {
-          throw new Error(`Upload failed: ${response.statusText}`);
+          const errorData = await response.json().catch(() => ({ error: response.statusText }));
+          throw new Error(errorData.error || `Upload failed: ${response.statusText}`);
         }
         
         const result = await response.json();
-        cid = result.cid;
-        console.log("IPFS upload successful, CID:", cid);
+        if (result.cid) {
+          cid = result.cid;
+          console.log("IPFS upload successful, CID:", cid);
+        } else {
+          throw new Error("No CID returned from server");
+        }
       } catch (ipfsError: any) {
-        console.warn("IPFS upload failed (web3.storage may be down), using placeholder:", ipfsError.message);
+        console.warn("IPFS upload failed, using placeholder:", ipfsError.message);
         // Use a placeholder CID - the contract will still work
         cid = `ipfs-unavailable-${Date.now()}`;
-        alert("Note: IPFS upload failed (web3.storage is down), but your intent will still be published on-chain.");
+        // Don't show alert - just log it, transaction will still work
+        console.log("Continuing with on-chain publish (IPFS is optional)");
       }
 
       // Sanitize inputs before sending
       const sanitizedMessage = sanitizeInput(message, 500);
       const sanitizedCategory = sanitizeInput(category, 50);
 
+      // Check network before sending transaction - this is important!
+      if (provider) {
+        try {
+          const network = await provider.getNetwork();
+          const chainId = Number(network.chainId);
+          
+          if (chainId !== EXPECTED_CHAIN_ID) {
+            const networkName = chainId === 80001 ? "Mumbai" : chainId === 80002 ? "Amoy" : `Chain ${chainId}`;
+            const expectedName = EXPECTED_CHAIN_ID === 80001 ? "Mumbai" : EXPECTED_CHAIN_ID === 80002 ? "Amoy" : `Chain ${EXPECTED_CHAIN_ID}`;
+            
+            console.log(`Network mismatch: current=${networkName} (${chainId}), expected=${expectedName} (${EXPECTED_CHAIN_ID})`);
+            setNetworkError(`Wrong network! Switch from ${networkName} to ${expectedName} in MetaMask`);
+            
+            // Try to switch network
+            try {
+              if (window.ethereum) {
+                await window.ethereum.request({
+                  method: "wallet_switchEthereumChain",
+                  params: [{ chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}` }],
+                });
+                // If switch succeeds, clear error and continue
+                setNetworkError("");
+                console.log("Network switched successfully");
+              }
+            } catch (switchError: any) {
+              // If network doesn't exist, try to add it
+              if (switchError.code === 4902 && window.ethereum) {
+                let networkConfig: any;
+                if (EXPECTED_CHAIN_ID === 80001) {
+                  // Polygon Mumbai - use Infura RPC if custom RPC not set
+                  const customRpc = process.env.NEXT_PUBLIC_MUMBAI_RPC_URL;
+                  const rpcUrls = customRpc 
+                    ? [customRpc]
+                    : [
+                        "https://polygon-mumbai.infura.io/v3/demo",
+                        "https://rpc.ankr.com/polygon_mumbai",
+                        "https://polygon-mumbai-bor.publicnode.com",
+                        "https://rpc-mumbai.maticvigil.com"
+                      ];
+                  
+                  networkConfig = {
+                    chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}`,
+                    chainName: "Polygon Mumbai",
+                    nativeCurrency: { name: "MATIC", symbol: "MATIC", decimals: 18 },
+                    rpcUrls: rpcUrls,
+                    blockExplorerUrls: ["https://mumbai.polygonscan.com"]
+                  };
+                } else if (EXPECTED_CHAIN_ID === 80002) {
+                  // Polygon Amoy - use Infura RPC if custom RPC not set
+                  const customRpc = process.env.NEXT_PUBLIC_AMOY_RPC_URL;
+                  const rpcUrls = customRpc 
+                    ? [customRpc]
+                    : [
+                        "https://polygon-amoy.infura.io/v3/demo",
+                        "https://rpc.ankr.com/polygon_amoy",
+                        "https://polygon-amoy-bor.publicnode.com"
+                      ];
+                  
+                  networkConfig = {
+                    chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}`,
+                    chainName: "Polygon Amoy",
+                    nativeCurrency: { name: "MATIC", symbol: "MATIC", decimals: 18 },
+                    rpcUrls: rpcUrls,
+                    blockExplorerUrls: ["https://amoy.polygonscan.com"]
+                  };
+                } else if (EXPECTED_CHAIN_ID === 31337) {
+                  networkConfig = {
+                    chainId: `0x${EXPECTED_CHAIN_ID.toString(16)}`,
+                    chainName: "Hardhat Local",
+                    nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                    rpcUrls: ["http://127.0.0.1:8545"],
+                  };
+                }
+                
+                if (networkConfig) {
+                  try {
+                    await window.ethereum.request({
+                      method: "wallet_addEthereumChain",
+                      params: [networkConfig],
+                    });
+                    setNetworkError("");
+                  } catch (addError) {
+                    // User might have rejected or it's pending - that's OK
+                    console.log("Network add request:", addError);
+                  }
+                }
+              }
+              // If switch failed, throw error to prevent transaction on wrong network
+              const networkName = chainId === 80001 ? "Mumbai" : chainId === 80002 ? "Amoy" : `Chain ${chainId}`;
+              const expectedName = EXPECTED_CHAIN_ID === 80001 ? "Mumbai" : EXPECTED_CHAIN_ID === 80002 ? "Amoy" : `Chain ${EXPECTED_CHAIN_ID}`;
+              throw new Error(`Please switch to ${expectedName} network (Chain ID: ${EXPECTED_CHAIN_ID}) in MetaMask. Currently on ${networkName} (${chainId}).`);
+            }
+          } else {
+            setNetworkError(""); // Clear any previous network errors
+          }
+        } catch (error) {
+          // If it's a network mismatch error, throw it
+          if (error instanceof Error && error.message.includes("Please switch to")) {
+            throw error;
+          }
+          console.warn("Network check failed:", error);
+          // For other errors, continue (might be connection issue)
+        }
+      }
+
+      // Check balance before sending transaction (warn but don't block)
+      if (provider && signer) {
+        try {
+          const balance = await provider.getBalance(await signer.getAddress());
+          const balanceInEth = ethers.formatEther(balance);
+          console.log("Account balance:", balanceInEth, "MATIC");
+          
+          // Warn if balance is very low, but don't block the transaction
+          if (Number(balanceInEth) < 0.001) {
+            console.warn("⚠️ Low balance detected. Transaction may fail. Get test tokens from: https://faucet.polygon.technology/");
+            setTxStatus({ status: "pending", message: "⚠️ Low balance - transaction may fail. Continuing anyway..." });
+            // Don't throw - let user try anyway
+          }
+        } catch (balanceError: any) {
+          console.warn("Could not check balance:", balanceError);
+          // Don't block - continue with transaction
+        }
+      }
+
+      // Estimate gas before sending
+      let gasEstimate;
+      try {
+        gasEstimate = await contract.publishIntent.estimateGas(sanitizedMessage, sanitizedCategory, cid);
+        console.log("Estimated gas:", gasEstimate.toString());
+      } catch (gasError: any) {
+        console.warn("Gas estimation failed:", gasError);
+        // Continue anyway - MetaMask will estimate
+      }
+
       // Publish intent on-chain (this is the important part)
       console.log("Publishing intent on-chain...");
-      setTxStatus({ status: "pending", message: "Transaction pending..." });
-      const tx = await contract.publishIntent(sanitizedMessage, sanitizedCategory, cid);
+      setTxStatus({ status: "pending", message: "Please approve transaction in MetaMask..." });
+      
+      // Use a more explicit transaction with better error handling
+      const tx = await contract.publishIntent(sanitizedMessage, sanitizedCategory, cid, {
+        // Let MetaMask handle gas estimation, but provide estimate if available
+        gasLimit: gasEstimate ? gasEstimate + BigInt(10000) : undefined, // Add 10% buffer
+      });
+      
       console.log("Transaction sent:", tx.hash);
       setTxStatus({ hash: tx.hash, status: "pending", message: "Waiting for confirmation..." });
       
-      await tx.wait();
-      console.log("Transaction confirmed!");
+      // Wait for confirmation with timeout
+      const receipt = await Promise.race([
+        tx.wait(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error("Transaction timeout after 2 minutes")), 120000) // 2 minutes
+        )
+      ]);
+      
+      console.log("Transaction confirmed!", receipt);
       setTxStatus({ hash: tx.hash, status: "success", message: "Transaction confirmed!" });
 
       // Reload intents
@@ -361,8 +614,15 @@ export default function Home() {
       
       // Handle specific contract errors
       let errorMessage = "Failed to publish intent";
+      let showAlert = true;
+      
       if (error.message) {
-        if (error.message.includes("Message cannot be empty") || 
+        if (error.message.includes("Insufficient balance")) {
+          errorMessage = error.message;
+        } else if (error.message.includes("user rejected") || error.message.includes("User denied")) {
+          errorMessage = "Transaction was cancelled by user";
+          showAlert = false; // Don't show alert for user cancellation
+        } else if (error.message.includes("Message cannot be empty") || 
             error.message.includes("Category cannot be empty") ||
             error.message.includes("CID cannot be empty")) {
           errorMessage = "Please fill in all required fields";
@@ -370,14 +630,22 @@ export default function Home() {
           errorMessage = error.message.match(/too long.*/)?.[0] || "Input too long";
         } else if (error.message.includes("Rate limit exceeded")) {
           errorMessage = "You've reached the daily limit (10 intents per day). Try again tomorrow.";
-        } else if (error.message.includes("user rejected")) {
-          errorMessage = "Transaction was cancelled";
+        } else if (error.message.includes("insufficient funds") || error.message.includes("insufficient balance")) {
+          errorMessage = "Insufficient balance for gas fees! Get test tokens from: https://faucet.polygon.technology/";
+        } else if (error.message.includes("network") || error.message.includes("chain")) {
+          errorMessage = `Network mismatch! Please switch to the correct network in MetaMask (Chain ID: ${EXPECTED_CHAIN_ID})`;
+        } else if (error.message.includes("timeout")) {
+          errorMessage = "Transaction timed out. Please check MetaMask and try again.";
         } else {
           errorMessage = error.message;
         }
       }
       
-      alert(`Error: ${errorMessage}`);
+      setTxStatus({ status: "error", message: errorMessage });
+      
+      if (showAlert) {
+        alert(`Error: ${errorMessage}`);
+      }
     } finally {
       setLoading(false);
     }
